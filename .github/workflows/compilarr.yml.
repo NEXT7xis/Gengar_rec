@@ -1,0 +1,776 @@
+name: Compilar APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gerar projeto
+        run: |
+          mkdir -p app/src/main/res/drawable-nodpi app/src/main/res/values app/src/main/java/com/gengar/rec
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GengarRec"
+          include(":app")
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF_2
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.gengar.rec"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.gengar.rec"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              buildTypes {
+                  debug {
+                      isDebuggable = false
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_3
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Gengar Rec"
+                  android:icon="@drawable/ic_launcher"
+                  android:theme="@style/App"
+                  android:allowBackup="false">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".RecorderService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection|microphone" />
+              </application>
+          </manifest>
+          EOF_4
+          cat > app/src/main/res/values/colors.xml <<'EOF_5'
+          <resources><color name="bg">#000000</color></resources>
+          EOF_5
+          cat > app/src/main/res/values/styles.xml <<'EOF_6'
+          <resources>
+              <style name="App" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/bg</item>
+              </style>
+          </resources>
+          EOF_6
+          cat > app/src/main/java/com/gengar/rec/RecorderService.kt <<'EOF_7'
+          package com.gengar.rec
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioPlaybackCaptureConfiguration
+          import android.media.AudioRecord
+          import android.media.MediaCodec
+          import android.media.MediaCodecInfo
+          import android.media.MediaFormat
+          import android.media.MediaMuxer
+          import android.media.MediaRecorder
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.ParcelFileDescriptor
+          import android.provider.MediaStore
+          import android.util.DisplayMetrics
+          import android.view.Display
+          import android.view.Surface
+          import android.widget.Toast
+          import java.nio.ByteBuffer
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+
+          /** Junta video + audio num MP4. Guarda amostras ate todas as trilhas existirem. */
+          private class Mux(fd: java.io.FileDescriptor, private val expectAudio: Boolean) {
+              private val m = MediaMuxer(fd, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+              @Volatile var vTrack = -1
+              @Volatile var aTrack = -1
+              @Volatile var started = false
+              private class Pending(val track: Int, val data: ByteArray, val info: MediaCodec.BufferInfo)
+              private val pending = ArrayList<Pending>()
+
+              @Synchronized fun addVideo(f: MediaFormat) { vTrack = m.addTrack(f); tryStart() }
+              @Synchronized fun addAudio(f: MediaFormat) { aTrack = m.addTrack(f); tryStart() }
+
+              private fun tryStart() {
+                  if (started) return
+                  if (vTrack >= 0 && (!expectAudio || aTrack >= 0)) {
+                      m.start()
+                      started = true
+                      for (p in pending) m.writeSampleData(p.track, ByteBuffer.wrap(p.data), p.info)
+                      pending.clear()
+                  }
+              }
+
+              @Synchronized fun write(track: Int, buf: ByteBuffer, info: MediaCodec.BufferInfo) {
+                  if (track < 0 || info.size <= 0) return
+                  if (started) {
+                      m.writeSampleData(track, buf, info)
+                  } else {
+                      val arr = ByteArray(info.size)
+                      buf.get(arr, 0, info.size)
+                      val bi = MediaCodec.BufferInfo()
+                      bi.set(0, info.size, info.presentationTimeUs, info.flags)
+                      pending.add(Pending(track, arr, bi))
+                  }
+              }
+
+              @Synchronized fun stop() {
+                  try { if (started) m.stop() } catch (_: Exception) {}
+                  try { m.release() } catch (_: Exception) {}
+              }
+          }
+
+          class RecorderService : Service() {
+              companion object {
+                  const val ACTION_START = "start"
+                  const val ACTION_STOP = "stop"
+                  private const val CH = "gengar_rec"
+                  private const val SR = 44100
+              }
+
+              private var projection: MediaProjection? = null
+              private var vd: VirtualDisplay? = null
+              private var vEnc: MediaCodec? = null
+              private var aEnc: MediaCodec? = null
+              private var inSurface: Surface? = null
+              private var gameRec: AudioRecord? = null
+              private var micRec: AudioRecord? = null
+              private var mux: Mux? = null
+              private var vThread: Thread? = null
+              private var aThread: Thread? = null
+              private var pfd: ParcelFileDescriptor? = null
+              private var uri: Uri? = null
+              @Volatile private var recording = false
+              private var baseUs = 0L
+              private val handler = Handler(Looper.getMainLooper())
+              private var pendingStart: Runnable? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              private fun cfg(k: String, d: String) =
+                  getSharedPreferences("cfg", Context.MODE_PRIVATE).getString(k, d) ?: d
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> { stopRecording(); stopSelf() }
+                      ACTION_START -> {
+                          val code = intent.getIntExtra("code", 0)
+                          @Suppress("DEPRECATION")
+                          val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+                              intent.getParcelableExtra("data", Intent::class.java) else intent.getParcelableExtra("data")
+                          val mode = cfg("audio", "game")
+                          val permOk = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                          val audioOn = mode != "none" && permOk
+                          val wantGame = audioOn && (mode == "game" || mode == "both")
+                          val wantMic = audioOn && (mode == "mic" || mode == "both")
+                          val delay = cfg("delay", "3").toInt()
+                          goForeground(if (delay > 0) "Começa em ${delay}s…" else "Gravando…", audioOn)
+                          if (data == null) { stopSelf(); return START_NOT_STICKY }
+                          val run = Runnable { startRecording(code, data, audioOn, wantGame, wantMic) }
+                          pendingStart = run
+                          handler.postDelayed(run, delay * 1000L)
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun goForeground(text: String, audio: Boolean) {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH, "Gravação", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(
+                      this, 0, Intent(this, RecorderService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val n = Notification.Builder(this, CH)
+                      .setContentTitle("Gengar Rec")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.presence_video_online)
+                      .setOngoing(true)
+                      .addAction(Notification.Action.Builder(null, "PARAR", stop).build())
+                      .build()
+                  var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                  if (audio && Build.VERSION.SDK_INT >= 30) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  startForeground(1, n, type)
+              }
+
+              private fun a16(v: Float) = ((v / 16f).roundToInt() * 16).coerceAtLeast(16)
+
+              @SuppressLint("MissingPermission")
+              private fun buildGameRec(p: MediaProjection): AudioRecord {
+                  val c = AudioPlaybackCaptureConfiguration.Builder(p)
+                      .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                      .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                      .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                      .build()
+                  val f = AudioFormat.Builder()
+                      .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                      .setSampleRate(SR)
+                      .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                      .build()
+                  return AudioRecord.Builder()
+                      .setAudioFormat(f)
+                      .setBufferSizeInBytes(16384)
+                      .setAudioPlaybackCaptureConfig(c)
+                      .build()
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun buildMicRec(): AudioRecord {
+                  val min = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                  return AudioRecord(
+                      MediaRecorder.AudioSource.MIC, SR, AudioFormat.CHANNEL_IN_MONO,
+                      AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 8192)
+                  )
+              }
+
+              private fun startRecording(code: Int, data: Intent, audioOn: Boolean, wantGame: Boolean, wantMic: Boolean) {
+                  try {
+                      val target = cfg("res", "540").toInt()
+                      val fps = cfg("fps", "60").toInt()
+                      val mbps = cfg("mbps", "4").toInt()
+                      val hevc = cfg("codec", "h264") == "hevc"
+
+                      val dm = DisplayMetrics()
+                      @Suppress("DEPRECATION")
+                      (getSystemService(DISPLAY_SERVICE) as DisplayManager)
+                          .getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm)
+                      val scale = min(1f, target.toFloat() / min(dm.widthPixels, dm.heightPixels))
+                      val w = a16(dm.widthPixels * scale)
+                      val h = a16(dm.heightPixels * scale)
+
+                      val name = "Gengar_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+                      val cv = ContentValues().apply {
+                          put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                          put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/GengarRec")
+                          put(MediaStore.Video.Media.IS_PENDING, 1)
+                      }
+                      uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv)
+                      pfd = contentResolver.openFileDescriptor(uri!!, "rw")
+                      val mx = Mux(pfd!!.fileDescriptor, audioOn)
+                      mux = mx
+
+                      val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val proj = mpm.getMediaProjection(code, data)
+                      projection = proj
+                      proj.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { handler.post { stopRecording(); stopSelf() } }
+                      }, handler)
+
+                      if (audioOn) {
+                          if (wantGame) gameRec = buildGameRec(proj)
+                          if (wantMic) micRec = buildMicRec()
+                          val af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, SR, 2).apply {
+                              setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                              setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+                              setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                          }
+                          val ae = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                          ae.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                          ae.start()
+                          aEnc = ae
+                      }
+
+                      val mime = if (hevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+                      val vf = MediaFormat.createVideoFormat(mime, w, h).apply {
+                          setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                          setInteger(MediaFormat.KEY_BIT_RATE, mbps * 1_000_000)
+                          setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                          setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                      }
+                      val ve = MediaCodec.createEncoderByType(mime)
+                      ve.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                      val surface = ve.createInputSurface()
+                      ve.start()
+                      vEnc = ve
+                      inSurface = surface
+
+                      vd = proj.createVirtualDisplay(
+                          "gengar", w, h, dm.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null
+                      )
+
+                      baseUs = System.nanoTime() / 1000
+                      recording = true
+                      vThread = Thread({ drainVideo() }, "gengar-video").also { it.start() }
+                      if (audioOn) aThread = Thread({ audioLoop() }, "gengar-audio").also { it.start() }
+
+                      val aTxt = when { wantGame && wantMic -> "jogo+mic"; wantGame -> "áudio do jogo"; wantMic -> "mic"; else -> "sem áudio" }
+                      goForeground("Gravando ${w}x${h} · ${fps}fps · $aTxt", audioOn)
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Erro ao gravar: ${e.message}", Toast.LENGTH_LONG).show()
+                      recording = false
+                      cleanup(false)
+                      stopSelf()
+                  }
+              }
+
+              private fun drainVideo() {
+                  val enc = vEnc ?: return
+                  val mx = mux ?: return
+                  val info = MediaCodec.BufferInfo()
+                  var firstPts = -1L
+                  var offset = 0L
+                  var last = -1L
+                  try {
+                      while (true) {
+                          val i = enc.dequeueOutputBuffer(info, 10_000)
+                          if (i == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { mx.addVideo(enc.outputFormat); continue }
+                          if (i < 0) continue
+                          val buf = enc.getOutputBuffer(i)
+                          if (buf != null && info.size > 0 && (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                              if (firstPts < 0) {
+                                  firstPts = info.presentationTimeUs
+                                  offset = System.nanoTime() / 1000 - baseUs
+                              }
+                              var pts = info.presentationTimeUs - firstPts + offset
+                              if (pts <= last) pts = last + 1
+                              last = pts
+                              info.presentationTimeUs = pts
+                              buf.position(info.offset)
+                              buf.limit(info.offset + info.size)
+                              mx.write(mx.vTrack, buf, info)
+                          }
+                          enc.releaseOutputBuffer(i, false)
+                          if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              private fun s16(b: ByteArray, i: Int): Int = ((b[i + 1].toInt() shl 8) or (b[i].toInt() and 0xFF)).toShort().toInt()
+
+              private fun put16(b: ByteArray, i: Int, v: Int) {
+                  val c = v.coerceIn(-32768, 32767)
+                  b[i] = (c and 0xFF).toByte()
+                  b[i + 1] = ((c shr 8) and 0xFF).toByte()
+              }
+
+              private fun drainAudio(enc: MediaCodec, mx: Mux, info: MediaCodec.BufferInfo): Boolean {
+                  while (true) {
+                      val i = enc.dequeueOutputBuffer(info, 0)
+                      if (i == MediaCodec.INFO_TRY_AGAIN_LATER) return false
+                      if (i == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { mx.addAudio(enc.outputFormat); continue }
+                      if (i < 0) continue
+                      val buf = enc.getOutputBuffer(i)
+                      if (buf != null && info.size > 0 && (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                          buf.position(info.offset)
+                          buf.limit(info.offset + info.size)
+                          mx.write(mx.aTrack, buf, info)
+                      }
+                      enc.releaseOutputBuffer(i, false)
+                      if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return true
+                  }
+              }
+
+              private fun audioLoop() {
+                  android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                  val enc = aEnc ?: return
+                  val mx = mux ?: return
+                  val game = gameRec
+                  val mic = micRec
+                  val info = MediaCodec.BufferInfo()
+                  val a = ByteArray(4096)
+                  val m = ByteArray(2048)
+                  var frames = 0L
+                  var aBase = -1L
+                  var lastPts = -1L
+                  try {
+                      game?.startRecording()
+                      mic?.startRecording()
+                      while (recording) {
+                          var n: Int
+                          if (game != null) {
+                              n = game.read(a, 0, a.size)
+                              if (n <= 0) continue
+                              if (mic != null) {
+                                  val k = mic.read(m, 0, min(m.size, n / 2))
+                                  if (k > 0) {
+                                      val cnt = min(k / 2, n / 4)
+                                      for (j in 0 until cnt) {
+                                          val mv = s16(m, 2 * j)
+                                          put16(a, 4 * j, s16(a, 4 * j) + mv)
+                                          put16(a, 4 * j + 2, s16(a, 4 * j + 2) + mv)
+                                      }
+                                  }
+                              }
+                          } else {
+                              val k = mic!!.read(m, 0, m.size)
+                              if (k <= 0) continue
+                              val cnt = k / 2
+                              for (j in 0 until cnt) {
+                                  a[4 * j] = m[2 * j]; a[4 * j + 1] = m[2 * j + 1]
+                                  a[4 * j + 2] = m[2 * j]; a[4 * j + 3] = m[2 * j + 1]
+                              }
+                              n = cnt * 4
+                          }
+                          if (aBase < 0) aBase = (System.nanoTime() / 1000 - baseUs) - (n / 4) * 1_000_000L / SR
+                          var off = 0
+                          while (off < n && recording) {
+                              val idx = enc.dequeueInputBuffer(10_000)
+                              if (idx >= 0) {
+                                  val ib = enc.getInputBuffer(idx) ?: continue
+                                  ib.clear()
+                                  val len = min(ib.remaining(), n - off)
+                                  ib.put(a, off, len)
+                                  var pts = aBase + frames * 1_000_000L / SR
+                                  if (pts <= lastPts) pts = lastPts + 1
+                                  lastPts = pts
+                                  enc.queueInputBuffer(idx, 0, len, pts, 0)
+                                  off += len
+                                  frames += (len / 4).toLong()
+                              }
+                              drainAudio(enc, mx, info)
+                          }
+                      }
+                      // fim: manda EOS e esvazia o encoder
+                      var idx = -1
+                      var tries = 0
+                      while (idx < 0 && tries < 50) { idx = enc.dequeueInputBuffer(10_000); tries++ }
+                      if (idx >= 0) enc.queueInputBuffer(idx, 0, 0, lastPts + 1000, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                      var t = 0
+                      while (t < 100 && !drainAudio(enc, mx, info)) { t++; Thread.sleep(10) }
+                  } catch (_: Exception) {}
+              }
+
+              private fun stopRecording() {
+                  pendingStart?.let { handler.removeCallbacks(it) }
+                  pendingStart = null
+                  val was = recording
+                  recording = false
+                  if (was) {
+                      try { vEnc?.signalEndOfInputStream() } catch (_: Exception) {}
+                      try { aThread?.join(3000) } catch (_: Exception) {}
+                      try { vThread?.join(3000) } catch (_: Exception) {}
+                  }
+                  val ok = was && (mux?.started == true)
+                  cleanup(ok)
+                  if (ok) Toast.makeText(this, "Salvo em Filmes/GengarRec", Toast.LENGTH_LONG).show()
+              }
+
+              private fun cleanup(ok: Boolean) {
+                  try { vd?.release() } catch (_: Exception) {}
+                  try { vEnc?.stop() } catch (_: Exception) {}
+                  try { vEnc?.release() } catch (_: Exception) {}
+                  try { inSurface?.release() } catch (_: Exception) {}
+                  try { aEnc?.stop() } catch (_: Exception) {}
+                  try { aEnc?.release() } catch (_: Exception) {}
+                  try { gameRec?.stop() } catch (_: Exception) {}
+                  try { gameRec?.release() } catch (_: Exception) {}
+                  try { micRec?.stop() } catch (_: Exception) {}
+                  try { micRec?.release() } catch (_: Exception) {}
+                  try { mux?.stop() } catch (_: Exception) {}
+                  try { projection?.stop() } catch (_: Exception) {}
+                  try { pfd?.close() } catch (_: Exception) {}
+                  uri?.let {
+                      try {
+                          if (ok) contentResolver.update(it, ContentValues().apply {
+                              put(MediaStore.Video.Media.IS_PENDING, 0)
+                          }, null, null) else contentResolver.delete(it, null, null)
+                      } catch (_: Exception) {}
+                  }
+                  vd = null; vEnc = null; aEnc = null; inSurface = null
+                  gameRec = null; micRec = null; mux = null
+                  projection = null; pfd = null; uri = null
+                  vThread = null; aThread = null
+              }
+
+              override fun onDestroy() { stopRecording(); super.onDestroy() }
+          }
+          EOF_7
+          cat > app/src/main/java/com/gengar/rec/MainActivity.kt <<'EOF_8'
+          package com.gengar.rec
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private val CARD = Color.parseColor("#0C0812")
+              private val STROKE = Color.parseColor("#3B1F52")
+              private val PURPLE = Color.parseColor("#9B4BC4")
+              private val PINK = Color.parseColor("#D45FE0")
+              private val CHIP = Color.parseColor("#1A1224")
+              private val MUTED = Color.parseColor("#9A86A8")
+              private val DEF = mapOf(
+                  "res" to "540", "fps" to "60", "mbps" to "4",
+                  "codec" to "h264", "audio" to "game", "delay" to "3"
+              )
+              private lateinit var sp: SharedPreferences
+              private val refreshers = mutableListOf<() -> Unit>()
+
+              private fun get(k: String) = sp.getString(k, DEF[k]) ?: DEF[k]!!
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun refreshAll() = refreshers.forEach { it() }
+
+              private fun shape(fill: Int, r: Int = 12, stroke: Int = 0) = GradientDrawable().apply {
+                  setColor(fill)
+                  cornerRadius = dp(r).toFloat()
+                  if (stroke != 0) setStroke(dp(1), stroke)
+              }
+
+              private fun text(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(color)
+                  if (bold) typeface = Typeface.DEFAULT_BOLD
+              }
+
+              private fun card(root: LinearLayout, title: String): LinearLayout {
+                  val c = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = shape(CARD, 16, STROKE)
+                      setPadding(dp(14), dp(12), dp(14), dp(14))
+                      layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(12) }
+                  }
+                  c.addView(text(title, 11f, PINK, true).apply {
+                      letterSpacing = 0.12f; setPadding(0, 0, 0, dp(8))
+                  })
+                  root.addView(c)
+                  return c
+              }
+
+              private fun segmented(card: LinearLayout, key: String, labels: List<String>, values: List<String>) {
+                  val row = LinearLayout(this)
+                  val tvs = labels.mapIndexed { i, l ->
+                      text(l, 13f, MUTED, true).apply {
+                          gravity = Gravity.CENTER
+                          setPadding(dp(2), dp(11), dp(2), dp(11))
+                          layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { setMargins(dp(3), 0, dp(3), 0) }
+                          setOnClickListener { sp.edit().putString(key, values[i]).apply(); refreshAll() }
+                      }
+                  }
+                  tvs.forEach { row.addView(it) }
+                  card.addView(row)
+                  refreshers += {
+                      tvs.forEachIndexed { i, t ->
+                          val on = get(key) == values[i]
+                          t.background = shape(if (on) PURPLE else CHIP, 10)
+                          t.setTextColor(if (on) Color.WHITE else MUTED)
+                      }
+                  }
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  sp = getSharedPreferences("cfg", MODE_PRIVATE)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.BLACK)
+                      setPadding(dp(18), dp(14), dp(18), dp(28))
+                  }
+
+                  // Cabeçalho
+                  root.addView(ImageView(this).apply {
+                      setImageResource(R.drawable.gengar_art)
+                      adjustViewBounds = true
+                      layoutParams = LinearLayout.LayoutParams(dp(200), WRAP_CONTENT).apply { gravity = Gravity.CENTER_HORIZONTAL }
+                  })
+                  root.addView(text("GENGAR REC", 24f, Color.WHITE, true).apply {
+                      gravity = Gravity.CENTER; letterSpacing = 0.2f; setPadding(0, dp(4), 0, 0)
+                  })
+                  root.addView(text("ゲンガー  ·  gravador de tela leve", 13f, PINK).apply {
+                      gravity = Gravity.CENTER; setPadding(0, dp(2), 0, dp(4))
+                  })
+
+                  // Presets
+                  val pc = card(root, "PRESETS")
+                  val prow = LinearLayout(this)
+                  fun preset(name: String, vals: Map<String, String>) {
+                      prow.addView(text(name, 13f, Color.WHITE, true).apply {
+                          gravity = Gravity.CENTER
+                          background = shape(CHIP, 10, PURPLE)
+                          setPadding(0, dp(11), 0, dp(11))
+                          layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { setMargins(dp(3), 0, dp(3), 0) }
+                          setOnClickListener {
+                              sp.edit().apply { vals.forEach { (k, v) -> putString(k, v) } }.apply()
+                              refreshAll()
+                          }
+                      })
+                  }
+                  preset("Ultra leve", mapOf("res" to "480", "fps" to "30", "mbps" to "2", "codec" to "h264"))
+                  preset("Leve 60fps", mapOf("res" to "540", "fps" to "60", "mbps" to "4", "codec" to "h264"))
+                  preset("HD", mapOf("res" to "720", "fps" to "60", "mbps" to "6", "codec" to "h264"))
+                  pc.addView(prow)
+
+                  segmented(card(root, "RESOLUÇÃO"), "res", listOf("480p", "540p", "720p", "1080p"), listOf("480", "540", "720", "1080"))
+                  segmented(card(root, "FPS"), "fps", listOf("24", "30", "45", "60"), listOf("24", "30", "45", "60"))
+                  segmented(card(root, "BITRATE (Mbps)"), "mbps", listOf("2", "4", "6", "8", "12"), listOf("2", "4", "6", "8", "12"))
+                  segmented(card(root, "CODEC"), "codec", listOf("H.264 (leve)", "H.265 (arquivo menor)"), listOf("h264", "hevc"))
+
+                  val ac = card(root, "ÁUDIO")
+                  segmented(ac, "audio", listOf("Sem", "Jogo", "Mic", "Jogo+Mic"), listOf("none", "game", "mic", "both"))
+                  ac.addView(text("Jogo = som interno do celular. Se algum jogo bloquear e sair mudo, use Mic.", 11f, MUTED).apply {
+                      setPadding(dp(4), dp(8), 0, 0)
+                  })
+
+                  segmented(card(root, "CONTAGEM ANTES DE GRAVAR"), "delay", listOf("0s", "3s", "5s", "10s"), listOf("0", "3", "5", "10"))
+
+                  val info = text("", 13f, MUTED).apply { setPadding(0, dp(16), 0, dp(12)); gravity = Gravity.CENTER }
+                  root.addView(info)
+                  refreshers += {
+                      val gbh = get("mbps").toInt() * 0.45
+                      info.text = "${get("res")}p · ${get("fps")}fps · ${get("mbps")} Mbps  ≈  ${"%.1f".format(gbh)} GB por hora"
+                  }
+
+                  root.addView(text("●  GRAVAR", 20f, Color.WHITE, true).apply {
+                      gravity = Gravity.CENTER
+                      letterSpacing = 0.15f
+                      background = GradientDrawable(
+                          GradientDrawable.Orientation.LEFT_RIGHT,
+                          intArrayOf(Color.parseColor("#7B3FC4"), Color.parseColor("#D45FE0"))
+                      ).apply { cornerRadius = dp(18).toFloat() }
+                      setPadding(0, dp(18), 0, dp(18))
+                      setOnClickListener { onRecord() }
+                  })
+                  root.addView(text(
+                      "Escolha \"Tela inteira\" ao iniciar. Para parar, use o botão PARAR da notificação. Vídeos em Filmes/GengarRec.",
+                      12f, MUTED
+                  ).apply { gravity = Gravity.CENTER; setPadding(0, dp(12), 0, 0) })
+
+                  setContentView(ScrollView(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                      addView(root, MATCH_PARENT, WRAP_CONTENT)
+                  })
+                  refreshAll()
+              }
+
+              private fun onRecord() {
+                  val need = mutableListOf<String>()
+                  if (get("audio") != "none" && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                      need += Manifest.permission.RECORD_AUDIO
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      need += Manifest.permission.POST_NOTIFICATIONS
+                  if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 2) else launchCapture()
+              }
+
+              override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(rc, p, r)
+                  if (rc == 2) {
+                      if (get("audio") != "none" && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          sp.edit().putString("audio", "none").apply(); refreshAll()
+                          Toast.makeText(this, "Sem permissão de áudio: gravando sem som", Toast.LENGTH_SHORT).show()
+                      }
+                      launchCapture()
+                  }
+              }
+
+              private fun launchCapture() {
+                  val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 1)
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 1 && res == RESULT_OK && data != null) {
+                      startForegroundService(
+                          Intent(this, RecorderService::class.java)
+                              .setAction(RecorderService.ACTION_START)
+                              .putExtra("code", res)
+                              .putExtra("data", data)
+                      )
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          EOF_8
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/gengar_art.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/ic_launcher.png
+          python3 - <<'PYEOF'
+          import zlib,struct,sys,base64
+          tiny=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==')
+          for n in ('gengar_art','ic_launcher'):
+              p='app/src/main/res/drawable-nodpi/'+n+'.png'
+              d=open(p,'rb').read(); ok=d[:8]==b'\x89PNG\r\n\x1a\n'; i=8
+              while ok and i<len(d):
+                  l,=struct.unpack('>I',d[i:i+4]); t=d[i+4:i+8]
+                  if zlib.crc32(d[i+4:i+8+l])&0xffffffff!=struct.unpack('>I',d[i+8+l:i+12+l])[0]: ok=False
+                  i+=12+l
+              if not ok:
+                  print('imagem corrompida, usando padrao',n); open(p,'wb').write(tiny)
+              else: print('imagem ok',n)
+          PYEOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Gengar-Rec-apk
+          path: app/build/outputs/apk/debug/*.apk
